@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8"> <!-- Установка кодировки для поддержки русского языка -->
+    <title>Эхо хоррор</title> <!-- Заголовок вкладки браузера -->
+    <style>
+        /* Стилизация интерфейса */
+        body { margin: 0; background: #000; overflow: hidden; color: #f00; font-family: 'Courier New', monospace; } /* Черный фон, скрываем прокрутку, красный шрифт */
+        canvas { display: block; filter: contrast(1.8) brightness(1.2); } /* Делаем картинку на канвасе сочной и контрастной */
+        #hud { position: fixed; top: 20px; left: 20px; z-index: 5; pointer-events: none; } /* Слой интерфейса поверх игры */
+        #sonar-ready { font-size: 24px; color: #0f0; text-shadow: 0 0 10px #0f0; } /* Зеленое свечение текста сонара */
+        #scream { 
+            position: fixed; top:0; left:0; width:100%; height:100%; 
+            background: #000; display: none; z-index: 1000;
+            justify-content: center; align-items: center;
+        } /* Экран скримера, по умолчанию скрыт */
+        .noise { background: url('https://media.giphy.com'); background-size: cover; opacity: 0.5; width: 100%; height: 100%; position: absolute; } /* Гифка с помехами для страха */
+    </style>
+</head>
+<body>
+
+<div id="hud"> <!-- Блок с текстом для игрока -->
+    <div id="sonar-ready">Эхо готово</div> <!-- Индикатор заряда -->
+    <div style="font-size: 11px; color: #555; margin-top:5px;">W,A,S,D - Движения | SPACE - Запуск Эхо</div> <!-- Подсказка по управлению -->
+</div>
+
+<div id="scream"> <!-- Контейнер скримера -->
+    <div class="noise"></div> <!-- Слой визуального шума -->
+    <h1 style="font-size: 80px; color: #f00; position: relative;">Сигнал потерян</h1> <!-- Текст при смерти -->
+</div>
+
+<canvas id="game"></canvas> <!-- Основной холст для отрисовки 3D -->
+
+<script>
+// --- ИНИЦИАЛИЗАЦИЯ ПЕРЕМЕННЫХ ---
+const canvas = document.getElementById('game'); // Получаем ссылку на холст
+const ctx = canvas.getContext('2d'); // Включаем режим рисования 2D (хотя рендер будет 3D)
+const sonarUI = document.getElementById('sonar-ready'); // Ссылка на текст сонара
+
+const mapSize = 23; // Размер лабиринта (23х23 клеток)
+let grid = []; // Массив, в котором будет храниться карта (1 - стена, 0 - проход)
+let particles = []; // Массив для летящих звуковых волн
+let charge = 100; // Текущий заряд сонара
+let isDead = false; // Состояние "жизни" игрока
+
+const player = { x: 1.5, y: 1.5, dir: 0 }; // Координаты и угол взгляда игрока
+const monster = { x: mapSize - 1.5, y: mapSize - 1.5, velX: 0, velY: 0, vis: 0 }; // Состояние монстра
+
+// --- ГЕНЕРАЦИЯ ЛАБИРИНТА (Алгоритм Recursive Backtracker) ---
+function genMap() {
+    grid = Array(mapSize * mapSize).fill(1); // Заполняем всю карту стенами
+    const stack = [{x: 1, y: 1}]; // Начинаем генерацию из точки 1,1
+    grid[1 + 1 * mapSize] = 0; // Делаем первую клетку пустой
+    while(stack.length > 0) { // Пока есть куда идти
+        const curr = stack[stack.length - 1]; // Берем текущую клетку
+        const dirs = [[0,2], [0,-2], [2,0], [-2,0]].sort(() => Math.random() - 0.5); // Случайный выбор направления
+        let moved = false; // Флаг: смогли ли мы сделать шаг
+        for(let [dx, dy] of dirs) { // Проверяем каждое направление
+            let nx = curr.x + dx, ny = curr.y + dy; // Координаты через одну клетку
+            if(nx > 0 && nx < mapSize && ny > 0 && ny < mapSize && grid[nx + ny * mapSize] === 1) { // Если там стена
+                grid[(curr.x + dx/2) + (curr.y + dy/2) * mapSize] = 0; // Пробиваем стену между клетками
+                grid[nx + ny * mapSize] = 0; // Делаем новую клетку пустой
+                stack.push({x: nx, y: ny}); // Прыгаем в новую клетку
+                moved = true; break; // Прерываем цикл, идем дальше
+            }
+        }
+        if(!moved) stack.pop(); // Если зашли в тупик, возвращаемся назад
+    }
+}
+
+// --- ЗВУКОВОЙ ДВИЖОК (Web Audio API) ---
+let audioCtx = new (window.AudioContext || window.webkitAudioContext)(); // Создаем аудио-контекст браузера
+function noise(f, d, v, type='sawtooth') { // Функция генерации синтетического звука
+    let o = audioCtx.createOscillator(), g = audioCtx.createGain(); // Создаем осциллятор и регулятор громкости
+    o.type = type; o.frequency.value = f; // Устанавливаем частоту и тип волны
+    g.gain.setValueAtTime(v, audioCtx.currentTime); // Ставим начальную громкость
+    g.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + d); // Плавное затухание звука за время d
+    o.connect(g); g.connect(audioCtx.destination); // Соединяем узлы и выводим на динамики
+    o.start(); o.stop(audioCtx.currentTime + d); // Запускаем и останавливаем звук через время d
+}
+
+// --- ФУНКЦИЯ ВЫБРОСА СОНАРА ---
+function emitEcho() {
+    if(charge < 100) return; // Если сонар не заряжен, ничего не делаем
+    charge = 0; // Сбрасываем заряд
+    noise(250, 0.4, 0.3, 'sine'); // Проигрываем звук "пинг"
+    for(let i=0; i<250; i++) { // Создаем 250 частиц звука
+        let ang = (player.dir - 1.0) + (Math.random() * 2.0); // Разлетаются конусом перед игроком
+        particles.push({
+            x: player.x, y: player.y, // Начальная позиция - игрок
+            vx: Math.cos(ang) * 0.4, // Скорость по X
+            vy: Math.sin(ang) * 0.4, // Скорость по Y
+            life: 4 // Время жизни частицы
+        });
+    }
+}
+
+// --- ГЛАВНЫЙ ИГРОВОЙ ЦИКЛ ОБНОВЛЕНИЯ ---
+function update() {
+    if(isDead) return; // Если игрок мертв, логика не работает
+
+    let speed = 0.035; // Скорость передвижения игрока
+    let nx = player.x, ny = player.y; // Будущие координаты
+    if(keys['KeyW']) { nx += Math.cos(player.dir) * speed; ny += Math.sin(player.dir) * speed; } // Идем вперед
+    if(keys['KeyS']) { nx -= Math.cos(player.dir) * speed; ny -= Math.sin(player.dir) * speed; } // Идем назад
+    if(keys['KeyA']) player.dir -= 0.065; // Поворот налево
+    if(keys['KeyD']) player.dir += 0.065; // Поворот направо
+    if(keys['Space']) emitEcho(); // Кнопка сонара
+
+    if(grid[Math.floor(ny)*mapSize + Math.floor(nx)] === 0) { player.x = nx; player.y = ny; } // Если впереди не стена, перемещаемся
+
+    particles.forEach((p, i) => { // Обработка каждой звуковой частицы
+        p.x += p.vx; p.y += p.vy; // Двигаем частицу
+        p.life -= 0.04; // Уменьшаем жизнь
+        
+        if(grid[Math.floor(p.y)*mapSize + Math.floor(p.x)] === 1) { // Если частица ударилась о стену
+            p.vx *= -0.8; p.vy *= -0.8; // Отскок с потерей энергии
+        }
+
+        let dM = Math.sqrt((p.x-monster.x)**2 + (p.y-monster.y)**2); // Расстояние от частицы до монстра
+        if(dM < 0.6) { // Если частица коснулась монстра
+            monster.velX += (player.x - monster.x) * 0.002; // Монстр получает импульс в сторону игрока
+            monster.velY += (player.y - monster.y) * 0.002; // Импульс по Y
+            monster.vis = 1.60; // Делаем монстра видимым на короткое время
+            p.life = 0; // Частица поглощается монстром
+        }
+        if(p.life <= 0) particles.splice(i, 1); // Удаляем мертвые частицы
+    });
+
+    monster.x += monster.velX; monster.y += monster.velY; // Двигаем монстра по его инерции
+    monster.velX *= 0.97; monster.velY *= 0.97; // Постепенное замедление монстра (вязкое трение)
+    if(monster.vis > 0) monster.vis -= 0.015; // Постепенное исчезновение монстра из вида
+
+    if(Math.sqrt((player.x-monster.x)**2 + (player.y-monster.y)**2) < 0.45) triggerScreamer(); // Если монстр вплотную - скример
+
+    if(charge < 100) { // Логика перезарядки
+        charge += 0.89; // Скорость зарядки
+        sonarUI.style.color = '#222'; // Текст тусклый
+        sonarUI.innerText = "Перезарядка";
+    } else {
+        sonarUI.style.color = '#0f0'; // Текст яркий
+        sonarUI.innerText = "Эхо готово";
+    }
+}
+
+// --- ОТРИСОВКА (Raycasting / Псевдо-3D) ---
+function draw() {
+    canvas.width = window.innerWidth; canvas.height = window.innerHeight; // Растягиваем канвас на весь экран
+    ctx.fillStyle = '#000'; ctx.fillRect(0,0,canvas.width,canvas.height); // Очищаем экран черным
+
+    const numRays = 250; // Количество лучей для отрисовки стен
+    for(let i=0; i<numRays; i++) {
+        let rayDir = (player.dir - 0.9) + (i/numRays) * 1.8; // Рассчитываем угол луча
+        let dist = 0, hit = false;
+        while(!hit && dist < 12) { // Пускаем луч, пока не ударится в стену
+            dist += 0.04; // Шаг луча
+            if(grid[Math.floor(player.y + Math.sin(rayDir)*dist)*mapSize + Math.floor(player.x + Math.cos(rayDir)*dist)] === 1) hit = true;
+        }
+
+        let intensity = 0; // Сила свечения стены
+        particles.forEach(p => { // Проверяем, есть ли рядом частицы звука
+            let pd = Math.sqrt((player.x + Math.cos(rayDir)*dist - p.x)**2 + (player.y + Math.sin(rayDir)*dist - p.y)**2);
+            if(pd < 1.8) intensity += (1.8 - pd) * p.life * 0.25; // Если частица рядом, стена "светится"
+        });
+
+        if(intensity > 0) { // Если стена видна
+            let h = canvas.height / (dist * Math.cos(rayDir-player.dir)); // Считаем высоту стены на экране (эффект перспективы)
+            ctx.fillStyle = `rgba(169, 179, 174, ${Math.min(intensity, 0.9)})`; // Цвет стены (зеленый эхолокатор)
+            ctx.fillRect(i*(canvas.width/numRays), (canvas.height-h)/2, (canvas.width/numRays)+1, h); // Рисуем вертикальную полоску
+        }
+    }
+
+    if(monster.vis > 0) { // Если монстр обнаружен эхом
+        let angle = Math.atan2(monster.y - player.y, monster.x - player.x) - player.dir; // Угол до монстра относительно игрока
+        if(angle < -Math.PI) angle += Math.PI*2; // Коррекция угла
+        if(angle > Math.PI) angle -= Math.PI*2;
+        if(Math.abs(angle) < 0.9) { // Если монстр в поле зрения
+            let dist = Math.sqrt((player.x-monster.x)**2 + (player.y-monster.y)**2); // Дистанция до монстра
+            let x = (angle / 1.8 + 0.5) * canvas.width; // Позиция монстра на экране по горизонтали
+            let h = canvas.height / dist; // Высота монстра на экране
+            ctx.fillStyle = `rgba(200, 125, 50, ${monster.vis})`; // Красный полупрозрачный силуэт
+            ctx.fillRect(x - h/12, (canvas.height-h)/2 - h*0.2, h/6, h * 1.4); // Рисуем тело
+            ctx.fillStyle = "white"; // Рисуем глаза
+            ctx.fillRect(x-4, canvas.height/2 - 10, 2, 2); 
+            ctx.fillRect(x+4, canvas.height/2 - 10, 2, 2);
+        }
+    }
+}
+
+// --- ФУНКЦИЯ СКРИМЕРА ---
+function triggerScreamer() {
+    if(isDead) return; // Чтобы скример не запускался дважды
+    isDead = true; // Ставим статус смерти
+    document.getElementById('scream').style.display = 'flex'; // Показываем скрытый блок скримера
+    noise(60, 2, 1, 'sawtooth'); // Жуткий низкий звук
+    noise(20, 2, 1, 'square'); // Второй слой шума
+    setTimeout(() => location.reload(), 2000); // Перезагружаем игру через 2 секунды
+}
+
+// --- СЛУШАТЕЛИ КЛАВИАТУРЫ ---
+const keys = {}; // Объект для хранения нажатых клавиш
+window.onkeydown = e => keys[e.code] = true; // Запоминаем нажатие
+window.onkeyup = e => keys[e.code] = false; // Запоминаем отпускание
+
+genMap(); // Генерируем лабиринт при загрузке
+setInterval(() => { update(); draw(); }, 1000/24); // Запускаем цикл игры (24 кадра в секунду)
+</script>
+</body>
+</html>
